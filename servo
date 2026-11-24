@@ -1,0 +1,18 @@
+#include <Servo.h>
+Servo tail;
+
+const int FLAT = 90;      // angle where the tail sits flat - change this to suit
+const int WAG  = 45 ;     // angle it wags out to
+
+void setup() {
+  tail.write(FLAT);      // set the angle first...
+  tail.attach(A0);       // ...then attach, so it goes straight to flat
+  delay(1000);           // give it time to get there
+}
+
+void loop() {
+  tail.write(WAG);
+  delay(300);
+  tail.write(FLAT);
+  delay(300);
+}
