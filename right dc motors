@@ -1,0 +1,52 @@
+// Right motors only
+const int R_B1A = 9, R_B1B = 10, R_A1A = 8, R_A1B = 7;
+
+const unsigned long RUN_MS = 1500;
+const unsigned long PAUSE_MS = 1000;
+
+void stopAll() {
+  digitalWrite(R_A1A, LOW); digitalWrite(R_A1B, LOW);
+  digitalWrite(R_B1A, LOW); digitalWrite(R_B1B, LOW);
+}
+
+// dir: 1 forward, -1 backward, 0 stop
+void motorA(int dir) {
+  digitalWrite(R_A1A, dir == 1);
+  digitalWrite(R_A1B, dir == -1);
+}
+
+void motorB(int dir) {
+  digitalWrite(R_B1A, dir == 1);
+  digitalWrite(R_B1B, dir == -1);
+}
+
+void step(const char* label, int a, int b) {
+  Serial.println(label);
+  motorA(a);
+  motorB(b);
+  delay(RUN_MS);
+  stopAll();
+  delay(PAUSE_MS);
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(R_B1A, OUTPUT); pinMode(R_B1B, OUTPUT);
+  pinMode(R_A1A, OUTPUT); pinMode(R_A1B, OUTPUT);
+  stopAll();
+
+  Serial.println("Right motor test - lift the robot so the wheels spin freely");
+  delay(3000);
+}
+
+void loop() {
+  step("Right motor A (pins 8,7) forward",   1, 0);
+  step("Right motor A (pins 8,7) backward", -1, 0);
+  step("Right motor B (pins 9,10) forward",   0, 1);
+  step("Right motor B (pins 9,10) backward",  0, -1);
+  step("Both right motors forward",          1, 1);
+  step("Both right motors backward",        -1, -1);
+
+  Serial.println("--- cycle done ---");
+  delay(3000);
+}
