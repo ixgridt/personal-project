@@ -1,0 +1,600 @@
+/*
+  Smart Bin Test Sketch (Arduino Uno)
+
+  Features:
+   1. Front ultrasonic sensor detects a hand within 5 cm -> lid servo opens
+      the lid, holds it open, then closes it.
+   2. Two side ultrasonic sensors watch the trash level with a filtered,
+      noise-tolerant detector (see FULL DETECTION below).
+   3. When full, the bin drives back and forth (4 DC motors), opens and
+      closes the lid, and wags its servo tail. Repeats every few seconds.
+   4. STOP: hold your hand within 5 cm of the front sensor for 5 seconds.
+      All movement pauses while your hand is there. After 5 seconds the side
+      sensors are checked:
+        - trash is out   -> the sequence stops and the bin re-arms
+        - trash still in -> movement stays paused until you remove your
+                            hand, then the bin keeps moving
+   5. Removing the trash (side sensors read far for 3 s) also stops it.
+
+  FULL DETECTION (side sensors)
+   - Each reading is the MEDIAN of several pings, so single bad echoes
+     and servo-induced timing glitches are ignored.
+   - Hysteresis: trash becomes "near" at <= 5 cm and only stops being near
+     once it is > 8 cm, so readings hovering around 5 cm don't flicker.
+   - By default a reading with 3+ missed pings is treated as "far" so the
+     bin can re-arm when the trash is removed. Set HOLD_STATE_ON_NO_ECHO to
+     true if your sensor misbehaves while trash is pressed against it.
+   - The 5 minute timer counts time spent near. Brief gaps (trash shifting)
+     are tolerated; only a gap longer than GAP_TOLERANCE_MS resets it.
+   - The timer is paused while the lid is open and for a few seconds after
+     it closes, so trash being dropped in doesn't count.
+   - "Emptied" must be seen continuously for a few seconds before the bin
+     re-arms.
+
+  TESTING THE FULL SEQUENCE
+   Open the Serial Monitor (9600 baud, any line ending), send 'f' to pretend
+   the bin is full, and 'r' to reset. Hold a hand at the front sensor for
+   5 s to test the stop (the check uses the real side sensors, so with no
+   trash near them the sequence stops; with trash near them it continues
+   after you remove your hand).
+
+  WIRING
+   Lid servo          signal -> A3
+   Tail servo         signal -> A0    (was D12; change TAIL_PIN if wired elsewhere)
+   Front HC-SR04      TRIG -> A2, ECHO -> A1
+   Side HC-SR04 #1    TRIG -> A5, ECHO -> A4
+   Side HC-SR04 #2    TRIG -> D11, ECHO -> D10
+   Left motors        B: 1A -> D5, 1B -> D4     A: 1A -> D3, 1B -> D2
+   Right motors       B: 1A -> D8, 1B -> D7     A: 1A -> D9, 1B -> D6
+   All grounds must be common (Arduino, sensors, motor drivers, battery).
+
+  NOTE: Motors run at full speed (digital on/off). The 1B pins used for
+  reverse (D2, D4, D7, D8) aren't PWM pins, and the Servo library disables
+  PWM on D9 and D10, so speed control isn't possible with this pin layout.
+*/
+
+#include <Servo.h>
+
+// ---------- TEST MODE ----------
+// true  = "full" timer is 10 seconds so you can test quickly
+// false = real 5 minute timer
+const bool TEST_MODE = true;
+
+// ---------- Pins ----------
+const int SERVO_PIN = A3;      // lid servo
+const int TAIL_PIN  = A0;      // tail servo
+
+const int FRONT_TRIG = A2;
+const int FRONT_ECHO = A1;
+
+const int SIDE_TRIG[2] = {A5, 11};
+const int SIDE_ECHO[2] = {A4, 10};
+
+// Motor driver pins (two motors per side, each with a 1A/1B input pair)
+const int LEFT_1A[2]  = {5, 3};
+const int LEFT_1B[2]  = {4, 2};
+const int RIGHT_1A[2] = {8, 9};
+const int RIGHT_1B[2] = {7, 6};
+
+// If a side drives the wrong way, flip its flag
+const bool LEFT_REVERSED  = false;
+const bool RIGHT_REVERSED = false;
+
+// ---------- Settings ----------
+int LID_CLOSED_ANGLE = 100;
+int LID_OPEN_ANGLE   = 30;
+
+// Total travel of your lid servo: 270 for a 270-degree servo, 180 for a standard one.
+// (The Servo library's write() only goes to 180, so angles are converted to pulses.)
+// With a 180-degree servo, any angle above 180 is clamped to 180.
+const int LID_SERVO_RANGE_DEG = 270;
+const int SERVO_MIN_US = 500;
+const int SERVO_MAX_US = 2500;
+
+const int TAIL_CENTER = 90;
+const int TAIL_LEFT   = 55;
+const int TAIL_RIGHT  = 125;
+const unsigned long TAIL_WAG_MS = 150;         // time between tail swings
+
+const float OPEN_DISTANCE_CM = 5.0;            // hand within 5 cm opens lid / counts as "hand present"
+const unsigned long LID_OPEN_TIME_MS = 3000;   // how long lid stays open
+const unsigned long STOP_HOLD_MS = 5000UL;     // hold hand 5 s to stop the full sequence
+const unsigned long HAND_GAP_TOLERANCE_MS = 800; // hand may drop out of range this long without resetting the 5 s
+
+// --- Full detection ---
+const float FULL_DISTANCE_CM = 5.0;            // trash at or closer than this = near
+const float FULL_CLEAR_DISTANCE_CM = 8.0;      // trash must be farther than this to stop being near
+const unsigned long FULL_TIME_MS = TEST_MODE ? 10000UL : 300000UL;  // 5 min near-time to be "full"
+const bool REQUIRE_BOTH_SENSORS = false;       // true = both side sensors must be near
+const bool HOLD_STATE_ON_NO_ECHO = false;      // false = no echo counts as "far" (bin can clear);
+                                               // true  = no echo keeps the last state
+
+const unsigned long SIDE_INTERVAL_MS = 1000;   // how often the side sensors are checked
+const int SIDE_SAMPLES = 5;                    // pings per reading (median of these)
+const int SIDE_MIN_VALID = 3;                  // need this many good pings for a valid reading
+const unsigned long GAP_TOLERANCE_MS = 5000;   // not-near longer than this resets the timer
+const unsigned long SETTLE_MS = 3000;          // ignore side sensors this long after lid closes
+const unsigned long EMPTY_CONFIRM_MS = 3000;   // not-near this long = bin was emptied
+
+const unsigned long MOVE_STEP_MS = 600;        // one forward or backward push
+const int SHAKE_CYCLES = 3;                    // back-and-forth cycles per routine
+const unsigned long FULL_REPEAT_MS = 0;        // pause between routines while full
+
+const unsigned long SENSOR_INTERVAL_MS = 100;  // front sensor check interval
+
+// ---------- State ----------
+Servo lid;
+Servo tail;
+bool lidOpen = false;
+unsigned long lidOpenedAt = 0;
+unsigned long lidClosedAt = 0;
+
+bool isFull = false;
+bool silenced = false;           // user stopped the sequence; wait for bin to be emptied
+bool simulateFull = false;       // set from Serial Monitor to test the full sequence
+unsigned long lastFullRoutine = 0;
+
+// Side-sensor detection state
+bool sideNear[2] = {false, false};
+float sideDist[2] = {-1, -1};
+unsigned long nearMs = 0;        // accumulated time trash has been near
+unsigned long notNearMs = 0;     // current continuous time trash has been not near
+unsigned long lastSideCheck = 0;
+
+float frontDist = -1;
+unsigned long handSince = 0;     // 0 = no hand being held at the front sensor
+unsigned long lastHandSeen = 0;
+bool handLockout = false;        // hand hold was rejected (trash still in); wait for hand to leave
+
+unsigned long lastFrontCheck = 0;
+unsigned long lastPrint = 0;
+
+// ---------- Ultrasonic ----------
+// Single ping. Returns distance in cm, or -1 if no echo / out of range
+float readDistanceCm(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  unsigned long duration = pulseIn(echoPin, HIGH, 30000UL);  // 30 ms timeout
+  if (duration == 0) return -1;
+  return duration * 0.0343 / 2.0;
+}
+
+// Median of several pings. Returns -1 if too few pings were valid.
+float readFilteredCm(int trigPin, int echoPin) {
+  float vals[SIDE_SAMPLES];
+  int n = 0;
+  for (int i = 0; i < SIDE_SAMPLES; i++) {
+    float d = readDistanceCm(trigPin, echoPin);
+    if (d > 0) vals[n++] = d;
+    delay(20);  // let echoes die out between pings
+  }
+  if (n < SIDE_MIN_VALID) return -1;
+
+  // insertion sort, then take the middle value
+  for (int i = 1; i < n; i++) {
+    float key = vals[i];
+    int j = i - 1;
+    while (j >= 0 && vals[j] > key) {
+      vals[j + 1] = vals[j];
+      j--;
+    }
+    vals[j + 1] = key;
+  }
+  return vals[n / 2];
+}
+
+// ---------- Lid ----------
+void lidWrite(int angle) {
+  angle = constrain(angle, 0, LID_SERVO_RANGE_DEG);
+  lid.writeMicroseconds(map(angle, 0, LID_SERVO_RANGE_DEG, SERVO_MIN_US, SERVO_MAX_US));
+}
+
+void openLid() {
+  lidWrite(LID_OPEN_ANGLE);
+  lidOpen = true;
+  lidOpenedAt = millis();
+  Serial.println("Lid: OPEN");
+}
+
+void closeLid() {
+  lidWrite(LID_CLOSED_ANGLE);
+  lidOpen = false;
+  lidClosedAt = millis();
+  Serial.println("Lid: CLOSED");
+}
+
+// ---------- Tail ----------
+void tailCenter() {
+  tail.write(TAIL_CENTER);
+}
+
+// Swing the tail to alternating sides; call repeatedly
+void wagTail() {
+  static unsigned long lastSwing = 0;
+  static bool toRight = false;
+  if (millis() - lastSwing >= TAIL_WAG_MS) {
+    lastSwing = millis();
+    toRight = !toRight;
+    tail.write(toRight ? TAIL_RIGHT : TAIL_LEFT);
+  }
+}
+
+// ---------- Motors ----------
+// dir: 1 = forward, -1 = backward, 0 = stop
+void setSide(const int pinsA[2], const int pinsB[2], int dir, bool reversed) {
+  if (reversed) dir = -dir;
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(pinsA[i], dir > 0 ? HIGH : LOW);
+    digitalWrite(pinsB[i], dir < 0 ? HIGH : LOW);
+  }
+}
+
+void stopMotors() {
+  setSide(LEFT_1A,  LEFT_1B,  0, LEFT_REVERSED);
+  setSide(RIGHT_1A, RIGHT_1B, 0, RIGHT_REVERSED);
+}
+
+void driveForward() {
+  setSide(LEFT_1A,  LEFT_1B,  1, LEFT_REVERSED);
+  setSide(RIGHT_1A, RIGHT_1B, 1, RIGHT_REVERSED);
+}
+
+void driveBackward() {
+  setSide(LEFT_1A,  LEFT_1B,  -1, LEFT_REVERSED);
+  setSide(RIGHT_1A, RIGHT_1B, -1, RIGHT_REVERSED);
+}
+
+// ---------- Full detection ----------
+void resetFullDetection() {
+  nearMs = 0;
+  notNearMs = 0;
+}
+
+// Update one sensor's near/not-near state with hysteresis.
+// No echo (-1) is handled per HOLD_STATE_ON_NO_ECHO.
+void updateNearState(int i, float d) {
+  if (d < 0) {
+    if (!HOLD_STATE_ON_NO_ECHO) sideNear[i] = false;
+    return;
+  }
+  if (sideNear[i]) {
+    if (d > FULL_CLEAR_DISTANCE_CM) sideNear[i] = false;
+  } else {
+    if (d <= FULL_DISTANCE_CM) sideNear[i] = true;
+  }
+}
+
+void updateFullDetection(unsigned long now) {
+  // Cap dt so a long blocking routine doesn't fake a big time jump
+  unsigned long dt = now - lastSideCheck;
+  if (dt > 2 * SIDE_INTERVAL_MS) dt = 2 * SIDE_INTERVAL_MS;
+  lastSideCheck = now;
+
+  for (int i = 0; i < 2; i++) {
+    sideDist[i] = readFilteredCm(SIDE_TRIG[i], SIDE_ECHO[i]);
+    updateNearState(i, sideDist[i]);
+  }
+
+  bool trashNear = simulateFull ||
+                   (REQUIRE_BOTH_SENSORS ? (sideNear[0] && sideNear[1])
+                                         : (sideNear[0] || sideNear[1]));
+
+  // Already full or stopped: wait for the bin to be emptied
+  if (isFull || silenced) {
+    if (trashNear) notNearMs = 0;
+    else notNearMs += dt;
+
+    if (notNearMs >= EMPTY_CONFIRM_MS) {
+      Serial.println("Bin emptied -> re-armed.");
+      isFull = false;
+      silenced = false;
+      resetFullDetection();
+    }
+    return;
+  }
+
+  // Lid in use (or just closed): pause the timer, don't reset it
+  bool blocked = lidOpen || (now - lidClosedAt < SETTLE_MS);
+  if (blocked) return;
+
+  if (trashNear) {
+    nearMs += dt;
+    notNearMs = 0;
+    if (nearMs >= FULL_TIME_MS) {
+      isFull = true;
+      handSince = 0;
+      lastFullRoutine = 0;  // run routine right away
+      Serial.println("Bin is FULL.");
+    }
+  } else {
+    notNearMs += dt;
+    if (notNearMs > GAP_TOLERANCE_MS) nearMs = 0;  // gap too long: start over
+  }
+}
+
+// ---------- Stop-by-hand logic ----------
+// Call with a fresh front distance reading. Returns true once a hand has been
+// held within range for STOP_HOLD_MS.
+// Short dropouts (up to HAND_GAP_TOLERANCE_MS) don't reset the count.
+// handSince != 0 means a hand is currently considered present.
+bool handHeldLongEnough(float d) {
+  unsigned long now = millis();
+  bool handNow = (d > 0 && d <= OPEN_DISTANCE_CM);
+
+  if (handLockout) {                 // last hold was rejected: ignore hand until removed
+    if (!handNow) handLockout = false;
+    return false;
+  }
+
+  if (handNow) {
+    if (handSince == 0) handSince = now;
+    lastHandSeen = now;
+  } else if (handSince != 0 && now - lastHandSeen > HAND_GAP_TOLERANCE_MS) {
+    handSince = 0;
+  }
+  return (handSince != 0 && now - handSince >= STOP_HOLD_MS);
+}
+
+// Fresh check of the side sensors: is there still trash against them?
+bool trashStillPresent() {
+  for (int i = 0; i < 2; i++) {
+    sideDist[i] = readFilteredCm(SIDE_TRIG[i], SIDE_ECHO[i]);
+    // no echo counts as far here, a real reading must be within the clear distance
+    sideNear[i] = (sideDist[i] > 0 && sideDist[i] <= FULL_CLEAR_DISTANCE_CM);
+  }
+  return REQUIRE_BOTH_SENSORS ? (sideNear[0] && sideNear[1])
+                              : (sideNear[0] || sideNear[1]);
+}
+
+// Stops everything and re-arms. Only called once the trash is confirmed out.
+void stopFullSequence() {
+  stopMotors();
+  closeLid();
+  tailCenter();
+  isFull = false;
+  silenced = false;
+  simulateFull = false;
+  resetFullDetection();
+  handSince = 0;
+  lastHandSeen = 0;
+  handLockout = false;
+  Serial.println("Trash is out -> sequence STOPPED and re-armed.");
+}
+
+// Called when a hand has been held for STOP_HOLD_MS.
+// Stops all movement and checks the side sensors:
+//  - trash out   -> sequence ends (returns true)
+//  - trash still -> movement stays paused until the hand leaves, then
+//                   the caller resumes the step (returns false)
+bool tryStopSequence() {
+  stopMotors();
+  Serial.println("Hand held -> checking that the trash is out...");
+
+  if (!trashStillPresent()) {
+    stopFullSequence();
+    return true;
+  }
+
+  Serial.print("Trash still detected (Side1 ");
+  Serial.print(sideDist[0], 1);
+  Serial.print(" cm, Side2 ");
+  Serial.print(sideDist[1], 1);
+  Serial.println(" cm) -> will resume once the hand is removed.");
+  handSince = 0;
+  lastHandSeen = 0;
+  handLockout = true;   // wait for hand to leave before resuming
+  return false;
+}
+
+// Drive step that wags the tail and watches the front sensor.
+// dir: 1 = forward, -1 = backward (the motors are already running when called).
+// While a hand is present the motors pause and the step timer freezes, so the
+// bin holds still while you hold your hand there.
+// After STOP_HOLD_MS the side sensors are checked:
+//   - trash out   -> sequence stops and re-arms (returns true)
+//   - trash still -> movement stays paused until the hand is removed,
+//                    then the step continues (returns false)
+bool waitAndWatch(unsigned long ms, int dir) {
+  unsigned long remaining = ms;
+  unsigned long last = millis();
+  bool paused = false;
+
+  while (remaining > 0) {
+    float d = readDistanceCm(FRONT_TRIG, FRONT_ECHO);
+
+    if (handHeldLongEnough(d)) {
+      if (tryStopSequence()) return true;
+      // Trash still present: handLockout is now true, so the bin will stay
+      // paused until the hand is removed, then resume.
+    }
+
+    // Treat a lockout (waiting for the hand to leave) as "hold still"
+    bool holdStill = (handSince != 0) || handLockout;
+
+    if (holdStill) {
+      if (!paused) {
+        stopMotors();
+        tailCenter();
+        paused = true;
+      }
+    } else {
+      wagTail();
+      if (paused) {
+        if (dir > 0) driveForward(); else driveBackward();
+        paused = false;
+      }
+    }
+
+    unsigned long now = millis();
+    unsigned long dt = now - last;
+    last = now;
+
+    if (!holdStill) {
+      remaining = (dt >= remaining) ? 0 : remaining - dt;
+    }
+    delay(30);
+  }
+  return false;
+}
+
+// Full-bin routine: drive forward/back, open/close lid, wag tail.
+void fullBinRoutine() {
+  Serial.println("BIN FULL -> back and forth + lid open/close + tail wag");
+  for (int i = 0; i < SHAKE_CYCLES; i++) {
+    openLid();
+    driveForward();
+    if (waitAndWatch(MOVE_STEP_MS, 1)) return;
+    stopMotors();
+
+    closeLid();
+    driveBackward();
+    if (waitAndWatch(MOVE_STEP_MS, -1)) return;
+    stopMotors();
+
+    // Check the side sensors between cycles so removing the trash stops it quickly
+    if (millis() - lastSideCheck >= SIDE_INTERVAL_MS) {
+      updateFullDetection(millis());
+      if (!isFull) {
+        closeLid();
+        tailCenter();
+        Serial.println("Trash removed -> routine stopped.");
+        return;
+      }
+    }
+  }
+  closeLid();
+  stopMotors();
+  tailCenter();
+  Serial.println("Routine complete.");
+}
+
+// ---------- Serial test commands ----------
+//  f = pretend the bin is full right now (starts the full sequence)
+//  r = reset the simulation (back to normal sensor behavior)
+void handleSerialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'f' || c == 'F') {
+      simulateFull = true;
+      silenced = false;
+      isFull = true;
+      handSince = 0;
+      lastHandSeen = 0;
+      handLockout = false;
+      lastFullRoutine = 0;
+      notNearMs = 0;
+      Serial.println("TEST: simulating FULL bin.");
+    } else if (c == 'r' || c == 'R') {
+      simulateFull = false;
+      silenced = false;
+      isFull = false;
+      handLockout = false;
+      sideNear[0] = sideNear[1] = false;
+      resetFullDetection();
+      stopMotors();
+      closeLid();
+      tailCenter();
+      Serial.println("TEST: simulation reset.");
+    }
+  }
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(FRONT_TRIG, OUTPUT);
+  pinMode(FRONT_ECHO, INPUT);
+  for (int i = 0; i < 2; i++) {
+    pinMode(SIDE_TRIG[i], OUTPUT);
+    pinMode(SIDE_ECHO[i], INPUT);
+    pinMode(LEFT_1A[i], OUTPUT);
+    pinMode(LEFT_1B[i], OUTPUT);
+    pinMode(RIGHT_1A[i], OUTPUT);
+    pinMode(RIGHT_1B[i], OUTPUT);
+  }
+  stopMotors();
+
+  lid.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  tail.attach(TAIL_PIN);
+  closeLid();
+  tailCenter();
+
+  lastSideCheck = millis();
+
+  Serial.println("Smart bin test started.");
+  Serial.print("Full timer: ");
+  Serial.print(FULL_TIME_MS / 1000);
+  Serial.println(" seconds of near-time");
+  Serial.print("Stop hold: ");
+  Serial.print(STOP_HOLD_MS / 1000);
+  Serial.println(" seconds");
+  Serial.println("Send 'f' to simulate a full bin, 'r' to reset.");
+}
+
+// ---------- Loop ----------
+void loop() {
+  unsigned long now = millis();
+  handleSerialCommands();
+
+  // Close lid after it has been open long enough (normal use only)
+  if (!isFull && lidOpen && now - lidOpenedAt >= LID_OPEN_TIME_MS) {
+    closeLid();
+  }
+
+  // ----- 1. Front sensor (fast) -----
+  if (now - lastFrontCheck >= SENSOR_INTERVAL_MS) {
+    lastFrontCheck = now;
+    frontDist = readDistanceCm(FRONT_TRIG, FRONT_ECHO);
+    bool handNear = (frontDist > 0 && frontDist <= OPEN_DISTANCE_CM);
+
+    if (isFull) {
+      // While full: hand held 5 s, then trash check (lid does not open on hand)
+      if (handHeldLongEnough(frontDist)) {
+        tryStopSequence();
+      }
+    } else {
+      handSince = 0;
+      // Normal use: hand within 5 cm opens the lid
+      if (handNear) {
+        if (!lidOpen) {
+          openLid();
+        } else {
+          lidOpenedAt = now;  // hand still there: keep lid open
+        }
+      }
+    }
+  }
+
+  // ----- 2. Side sensors (slower, filtered) -----
+  if (now - lastSideCheck >= SIDE_INTERVAL_MS) {
+    updateFullDetection(now);
+  }
+
+  // ----- 3. Full: repeat back-and-forth + lid + tail routine -----
+  now = millis();
+  if (isFull && (lastFullRoutine == 0 || now - lastFullRoutine >= FULL_REPEAT_MS)) {
+    fullBinRoutine();
+    lastFullRoutine = millis();
+  }
+
+  // ----- Debug print every 500 ms -----
+  if (now - lastPrint >= 500) {
+    lastPrint = now;
+    Serial.print("Front: "); Serial.print(frontDist, 1);
+    Serial.print(" cm | Side1: "); Serial.print(sideDist[0], 1);
+    Serial.print(sideNear[0] ? " (near)" : " (far)");
+    Serial.print(" | Side2: "); Serial.print(sideDist[1], 1);
+    Serial.print(sideNear[1] ? " (near)" : " (far)");
+    Serial.print(" | Near time: "); Serial.print(nearMs / 1000);
+    Serial.print("s | Hand hold: ");
+    Serial.print(handSince ? (now - handSince) / 1000 : 0);
+    Serial.print("s | Full: "); Serial.print(isFull ? "YES" : "no");
+    Serial.print(" | Silenced: "); Serial.print(silenced ? "YES" : "no");
+    Serial.print(" | Lockout: "); Serial.println(handLockout ? "YES" : "no");
+  }
+}
