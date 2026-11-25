@@ -1,0 +1,34 @@
+// Second Arduino (Uno or Nano) - dedicated audio player
+// Plays screech.wav from the SD card while the trigger pin is held LOW by the main board.
+
+#include <SD.h>
+#include <TMRpcm.h>
+
+const int SD_CS_PIN = 10;     // SD reader CS (MOSI 11, MISO 12, SCK 13 are fixed)
+const int AUDIO_PIN = 9;      // audio out -> resistor -> PAM8403 L input
+const int TRIGGER_PIN = 2;    // wire from main board; LOW = play, HIGH = stop
+
+TMRpcm audio;
+bool sdOk = false;
+
+void setup() {
+  pinMode(TRIGGER_PIN, INPUT_PULLUP);   // stays HIGH (stopped) if the wire is unplugged
+
+  audio.speakerPin = AUDIO_PIN;
+  audio.setVolume(5);                   // 0 to 7
+  audio.quality(0);
+
+  sdOk = SD.begin(SD_CS_PIN);
+}
+
+void loop() {
+  if (!sdOk) return;   // card not found: do nothing
+
+  bool shouldPlay = (digitalRead(TRIGGER_PIN) == LOW);
+
+  if (shouldPlay && !audio.isPlaying()) {
+    audio.play("screech.wav");          // restarts the file if it ends while still triggered
+  } else if (!shouldPlay && audio.isPlaying()) {
+    audio.stopPlayback();
+  }
+}
