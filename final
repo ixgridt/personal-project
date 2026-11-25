@@ -67,8 +67,8 @@ const int TAIL_PIN  = A0;      // tail servo
 const int FRONT_TRIG = A2;
 const int FRONT_ECHO = A1;
 
-const int SIDE_TRIG[2] = {A5, 11};
-const int SIDE_ECHO[2] = {A4, 10};
+const int SIDE_TRIG[2] = {12, 11};
+const int SIDE_ECHO[2] = {13, 10};
 
 // Motor driver pins (two motors per side, each with a 1A/1B input pair)
 const int LEFT_1A[2]  = {5, 3};
@@ -81,7 +81,7 @@ const bool LEFT_REVERSED  = false;
 const bool RIGHT_REVERSED = false;
 
 // ---------- Settings ----------
-int LID_CLOSED_ANGLE = 100;
+int LID_CLOSED_ANGLE = 120;
 int LID_OPEN_ANGLE   = 30;
 
 // Total travel of your lid servo: 270 for a 270-degree servo, 180 for a standard one.
