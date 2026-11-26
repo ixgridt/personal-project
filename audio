@@ -1,34 +1,90 @@
-// Second Arduino (Uno or Nano) - dedicated audio player
-// Plays screech.wav from the SD card while the trigger pin is held LOW by the main board.
+// Single Arduino Uno: plays a WAV file from an SD card through a PAM8403 amplifier.
+//
+// Wiring:
+//   SD reader  VCC -> 5V, GND -> GND, MOSI(DI) -> 11, MISO(DO) -> 12, SCK(CLK) -> 13, CS -> 10
+//   Pin 9 -> resistor (1k to 10k) -> PAM8403 L input
+//   Arduino GND -> PAM8403 G and GND, Arduino 5V -> PAM8403 5V
+//   Speaker -> PAM8403 L+ and L-
+//
+// SD card: FAT32, with the WAV in the root folder.
+// WAV format: 8-bit, mono, 16 kHz or lower. File name: 8 characters or fewer before ".wav".
+//
+// Serial Monitor (9600 baud) commands:
+//   p = play, s = stop, + = louder, - = quieter
 
 #include <SD.h>
 #include <TMRpcm.h>
 
-const int SD_CS_PIN = 10;     // SD reader CS (MOSI 11, MISO 12, SCK 13 are fixed)
-const int AUDIO_PIN = 9;      // audio out -> resistor -> PAM8403 L input
-const int TRIGGER_PIN = 2;    // wire from main board; LOW = play, HIGH = stop
+const int SD_CS_PIN = 10;
+const int AUDIO_PIN = 9;           // fixed by TMRpcm on an Uno
+const char* FILE_NAME = "screech.wav";
 
 TMRpcm audio;
-bool sdOk = false;
+int volumeLevel = 5;               // 0 to 7
+bool autoRepeat = true;            // keeps playing the file until you press s
 
 void setup() {
-  pinMode(TRIGGER_PIN, INPUT_PULLUP);   // stays HIGH (stopped) if the wire is unplugged
+  Serial.begin(9600);
 
   audio.speakerPin = AUDIO_PIN;
-  audio.setVolume(5);                   // 0 to 7
+  audio.setVolume(volumeLevel);
   audio.quality(0);
 
-  sdOk = SD.begin(SD_CS_PIN);
+  Serial.println("Starting SD card...");
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("SD FAILED. Check:");
+    Serial.println(" - Card is FAT32 and fully inserted");
+    Serial.println(" - MOSI 11, MISO 12, SCK 13, CS 10");
+    Serial.println(" - Reader VCC is on 5V and GND on GND");
+    while (true) { delay(1000); }
+  }
+  Serial.println("SD OK");
+
+  if (!SD.exists(FILE_NAME)) {
+    Serial.print(FILE_NAME);
+    Serial.println(" NOT FOUND in the root folder");
+    Serial.println("Check the name (hidden .wav.wav?) and that it is not in a folder");
+    while (true) { delay(1000); }
+  }
+  Serial.print(FILE_NAME);
+  Serial.println(" found");
+
+  Serial.println("Commands: p = play, s = stop, + = louder, - = quieter");
+  audio.play(FILE_NAME);
+  Serial.println("Playing...");
 }
 
 void loop() {
-  if (!sdOk) return;   // card not found: do nothing
+  // restart the file when it ends, if repeat is on
+  if (autoRepeat && !audio.isPlaying()) {
+    delay(300);
+    audio.play(FILE_NAME);
+  }
 
-  bool shouldPlay = (digitalRead(TRIGGER_PIN) == LOW);
+  if (Serial.available()) {
+    char c = Serial.read();
 
-  if (shouldPlay && !audio.isPlaying()) {
-    audio.play("screech.wav");          // restarts the file if it ends while still triggered
-  } else if (!shouldPlay && audio.isPlaying()) {
-    audio.stopPlayback();
+    if (c == 'p') {
+      autoRepeat = true;
+      if (!audio.isPlaying()) audio.play(FILE_NAME);
+      Serial.println("Playing");
+    }
+    else if (c == 's') {
+      autoRepeat = false;
+      audio.stopPlayback();
+      Serial.println("Stopped");
+    }
+    else if (c == '+') {
+      volumeLevel = min(volumeLevel + 1, 7);
+      audio.setVolume(volumeLevel);
+      Serial.print("Volume: ");
+      Serial.println(volumeLevel);
+    }
+    else if (c == '-') {
+      volumeLevel = max(volumeLevel - 1, 0);
+      audio.setVolume(volumeLevel);
+      Serial.print("Volume: ");
+      Serial.println(volumeLevel);
+    }
   }
 }
